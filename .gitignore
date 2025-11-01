@@ -35,3 +35,6 @@ build/
 # OS
 Thumbs.db
 
+# Adicionados por mim
+Temp/
+Temp_*/

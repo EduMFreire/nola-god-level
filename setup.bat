@@ -17,4 +17,4 @@ call "venv\Scripts\activate.bat"
 REM Baixar os requirements do app.
 pip install -r "app_requirements.txt"
 
-REM Depois, podemos rodar o streamlit run app.py de run.bat sempre que quisermos rodar o app.
+REM Depois, podemos rodar o streamlit run App/app.py de run.bat sempre que quisermos rodar o app.

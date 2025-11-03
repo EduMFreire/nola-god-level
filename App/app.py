@@ -5,24 +5,35 @@ import sqlalchemy
 from settings import *
 from utilities import *
 
-# Conexão com o banco de dados
 @st.cache_resource
 def get_db_engine():
+    'Cria a conexão com o banco de dados'
     db_url = "postgresql://challenge:challenge_2024@localhost:5432/challenge_db"
     engine = sqlalchemy.create_engine(db_url)
     return engine
 
+@st.cache_data
+def load_data(_engine, query):
+    '''
+    Faz uma query e retorna um DataFrame com o resultado.
+    
+    O decorador cache_data faz com que, caso a função seja chamada com o mesmo query, o resultado seja o mesmo, sem fazer a query de novo. Ou seja, asssumimos que o banco de dados não muda ao longo da execução do app.
+
+    _engine, devido ao _, é ignorado (se a função for chamada com a mesma query, mas _engine diferente, o resultado será o mesmo). Isso não é um problema neste projeto, pois temos apenas uma única engine.
+    '''
+
+    assert isinstance(_engine, sqlalchemy.Engine)
+
+    try:
+        with _engine.connect() as connection:
+            df = pd.read_sql(query, connection)
+        return df
+    except Exception as e:
+        if DEBUG_SHOW_ERROR_MESSAGES: st.error(f"Erro ao conectar com o banco de dados: {e}")
+        return pd.DataFrame() # Retorna DF vazio em caso de erro
+
 class Main:
     'Representa toda a página'
-    def load_data(self, query):
-        'Faz uma query e retorna um DataFrame com o resultado'
-        try:
-            with self.engine.connect() as connection:
-                df = pd.read_sql(query, connection)
-            return df
-        except Exception as e:
-            if DEBUG_SHOW_ERROR_MESSAGES: st.error(f"Erro ao conectar com o banco de dados: {e}")
-            return pd.DataFrame() # Retorna DF vazio em caso de erro
 
     def __init__(self):
         'Constrói toda a página'
@@ -40,25 +51,40 @@ class Main:
         self.engine = get_db_engine()
 
         # BARRA LATERAL (FILTROS)
-        self.selected_stores, self.selected_channels, self.start_date, self.end_date = self.build_sidebar()
+        self.selected_stores, self.selected_products, self.selected_channels, self.start_date, self.end_date, self.time_start, self.time_end = self.build_sidebar()
 
         # ABAS PRINCIPAIS
-        self.tab_overview, self.tab_products = st.tabs(["Visão Geral", "Análise de Produtos"])
+        self.tab_overview, self.tab_products, self.tab_stores = st.tabs(["Visão Geral", "Análise de Produtos", "Análise de Lojas"])
         
         self.build_tab_overview()
         self.build_tab_products()
+        self.build_tab_stores()
+
+    def load_data(self, query):
+        return load_data(self.engine, query)
 
     def build_sidebar(self):
         '''
         Constrói a barra lateral da página, e retorna o input dado nela.
-        Isto é, retorna uma tupla (selected_stores: list, selected_channels: list, start_date: str, end_date: str)
+        Isto é, retorna uma tupla (
+            selected_stores: list
+            selected_products: list
+            selected_channels: list, 
+            start_date: str,
+            end_date: str,
+            time_range_start: int,
+            time_range_end: int
+        )
         '''
 
         st.sidebar.header("Filtros Globais")
         # Carrega dados para os filtros (ex: lista de lojas)
-        # Esta query só roda uma vez graças ao cache
+
         stores_df = self.load_data("SELECT id, name FROM stores ORDER BY name")
         stores_list = stores_df['name'].tolist()
+
+        products_df = self.load_data("SELECT id, name FROM products ORDER BY name")
+        products_list = products_df['name'].tolist()
 
         channels_df = self.load_data("SELECT id, name FROM channels ORDER BY name")
         channels_list = channels_df['name'].tolist()
@@ -69,7 +95,11 @@ class Main:
             options=stores_list,
             help="Deixe em branco para selecionar todas as lojas."
         )
-
+        selected_products = st.sidebar.multiselect(
+            "Produtos:",
+            options = products_list,
+            help="Filtra para considerar apenas as vendas contendo os produtos selecionados. O faturamento de outros produtos vendidos nessas mesmas vendas continua sendo considerado. Deixe em branco para selecionar todos os produtos."
+        )
         selected_channels = st.sidebar.multiselect(
             "Canais:",
             options=channels_list,
@@ -78,6 +108,7 @@ class Main:
 
         # Selecionar nada significa selecionar tudo
         if selected_stores == []: selected_stores = stores_list
+        if selected_products == []: selected_products = products_list
         if selected_channels == []: selected_channels = channels_list
 
         # Filtro de data
@@ -98,6 +129,16 @@ class Main:
             start_date = dates[0]
             end_date = dates[1]
 
+        # Filtro de horário
+        time_range_start, time_range_end = st.sidebar.slider(
+            "Intervalo de Horário:",
+            min_value=0,
+            max_value=24,
+            value=(0, 24), # Default: (00:00, 24:00)
+            format="%d:00h", # Formata os labels do slider
+            help="Selecione o intervalo de horas para análise."
+        )
+
         # Para debug: mostra os filtros selecionados
         if DEBUG_SHOW_FILTERS:
             st.sidebar.subheader("Debug Info")
@@ -109,36 +150,50 @@ class Main:
                 "data_fim": str(end_date)
             })
 
-        return selected_stores, selected_channels, start_date, end_date
+        return selected_stores, selected_products, selected_channels, start_date, end_date, time_range_start, time_range_end
 
     def get_where_sql(self):
-        'Constrói a cláusula WHERE baseada nos filtros e retorna'
+        'Constrói a cláusula WHERE baseada nos filtros e retorna. Assume que nenhum filtro está vazio (aplicamos a lógica empty=all para garantir isso nos demais métodos)'
         assert len(self.selected_stores) > 0
         assert len(self.selected_stores) > 0
 
         # Lógica de Query
-        
-        # Se self.selected_stores estiver vazio, o que quero?
+        # Pega a lista total de produtos para comparar
+        products_list_df = self.load_data("SELECT name FROM products")
+        all_products_list = products_list_df['name'].tolist()
+
         where_clauses = [
             f"st.name IN ({', '.join([f"'{s}'" for s in self.selected_stores])})",
             f"ch.name IN ({', '.join([f"'{c}'" for c in self.selected_channels])})",
-            f"s.created_at BETWEEN '{self.start_date}' AND '{self.end_date}'"
+            f"s.created_at BETWEEN '{self.start_date}' AND '{self.end_date}'",
+            f"EXTRACT(HOUR FROM s.created_at) BETWEEN {self.time_start} AND {self.time_end - 1}" # Subtraímos 1 porque BETWEEN é inclusivo
         ]
 
-        # Junta com 'AND' se houver filtros
-        where_sql = " AND ".join(where_clauses)
-        if where_sql:
-            where_sql = "WHERE " + where_sql
+        # Só adiciona o filtro de produto se o usuário NÃO selecionou "todos"
+        if len(self.selected_products) != len(all_products_list):
+            # Constrói a subquery
+            product_filter_subquery = f"""
+                s.id IN (
+                    SELECT DISTINCT ps.sale_id
+                    FROM product_sales ps
+                    JOIN products p ON ps.product_id = p.id
+                    WHERE p.name IN ({', '.join([f"'{p}'" for p in self.selected_products])})
+                )
+            """
+            where_clauses.append(product_filter_subquery)
 
+        # Junta com 'AND' se houver filtros
+        where_sql = "WHERE " + " AND ".join(where_clauses)
         return where_sql
 
     def build_tab_overview(self):
+        'Constrói a aba de visão geral.'
         where_sql = self.get_where_sql()
 
         with self.tab_overview:
             st.header("Visão Geral de Performance")
 
-            # --- Exemplo de Query para KPIs ---
+            # Exemplo de Query para KPIs
             kpi_query = f"""
                 SELECT
                     COUNT(s.id) as total_vendas,
@@ -167,7 +222,7 @@ class Main:
             else:
                 st.warning("Nenhum dado encontrado para os filtros selecionados.")
 
-            # --- Gráfico de Linha (Exemplo) ---
+            # Gráfico de Linha
             st.subheader("Faturamento por Dia")
             chart_query = f"""
                 SELECT
@@ -190,6 +245,7 @@ class Main:
                 st.warning("Nenhum dado para o gráfico.")
 
     def build_tab_products(self):
+        'Constrói a aba de análise de produtos'
         where_sql = self.get_where_sql()
 
         with self.tab_products:
@@ -211,8 +267,9 @@ class Main:
                 AND s.sale_status_desc = 'COMPLETED'
                 GROUP BY p.name
                 ORDER BY faturamento_produto DESC
-                LIMIT 50
             """
+            if LIMIT_LIST_VIEW:
+                product_query += f"\nLIMIT {LIMIT_LIST_VIEW_AMOUNT}"
 
             product_data = self.load_data(product_query)
 
@@ -228,5 +285,49 @@ class Main:
                 )
             else:
                 st.warning("Nenhum produto encontrado para os filtros selecionados.")
+
+    def build_tab_stores(self):
+        'Constrói a aba de análise de lojas.'
+        where_sql = self.get_where_sql()
+
+        with self.tab_stores:
+            st.header("Análise de Lojas")
+            st.write("Performance das lojas baseada nos filtros globais.")
+
+            # Query SQL focada em agrupar por loja
+            store_query = f"""
+                SELECT
+                    st.name as loja,
+                    COUNT(s.id) as total_vendas,
+                    SUM(s.total_amount) as faturamento_total,
+                    AVG(s.total_amount) as ticket_medio,
+                    AVG(s.delivery_seconds / 60.0) as avg_tempo_entrega_min
+                FROM sales s
+                JOIN stores st ON s.store_id = st.id
+                JOIN channels ch ON s.channel_id = ch.id
+                {where_sql}
+                AND s.sale_status_desc = 'COMPLETED'
+                GROUP BY st.name
+                ORDER BY faturamento_total DESC
+            """
+            
+            if LIMIT_LIST_VIEW:
+                store_query += f"\nLIMIT {LIMIT_LIST_VIEW_AMOUNT}"
+
+            store_data = self.load_data(store_query)
+
+            if not store_data.empty:
+                # Exibe os dados da loja
+                st.dataframe(store_data, use_container_width=True)
+
+                # Botão de Exportar (Critério 4)
+                st.download_button(
+                    label="Exportar Relatório de Lojas (CSV)",
+                    data=store_data.to_csv(index=False).encode('utf-8'),
+                    file_name='relatorio_lojas.csv',
+                    mime='text/csv',
+                )
+            else:
+                st.warning("Nenhuma loja encontrada para os filtros selecionados.")
 
 Main()

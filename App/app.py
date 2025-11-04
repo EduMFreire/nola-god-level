@@ -110,7 +110,7 @@ class Main:
         )
 
         selected_statuses = st.sidebar.multiselect(
-            "Status da Venda:",
+            "Status da venda:",
             options=self.status_list,
             default=['COMPLETED'], # Começa mostrando apenas vendas completas
             placeholder="Selecione os status de venda",
